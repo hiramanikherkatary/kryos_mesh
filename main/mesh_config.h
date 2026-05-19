@@ -15,7 +15,7 @@
  */
 
 #ifndef KRYOS_NODE_ID
-#define KRYOS_NODE_ID 4
+#define KRYOS_NODE_ID 1
 #endif
 
 #ifndef KRYOS_NODE_ROLE_ROOT
@@ -23,7 +23,7 @@
 #endif
 
 #ifndef KRYOS_NODE_ROLE_LEADER
-#define KRYOS_NODE_ROLE_LEADER 0
+#define KRYOS_NODE_ROLE_LEADER 1
 #endif
 
 #define KRYOS_IS_ROOT_NODE       (KRYOS_NODE_ROLE_ROOT == 1)

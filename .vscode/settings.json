@@ -1,6 +1,6 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.currentSetup": "/home/hiroroo/.espressif/v6.0/esp-idf",
+  "idf.currentSetup": "/home/shawrhit/esp/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c3"
   },
