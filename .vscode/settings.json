@@ -1,0 +1,18 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.currentSetup": "/home/hiroroo/.espressif/v6.0/esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32c3"
+  },
+  "idf.port": "/dev/ttyACM0",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/hiroroo/Documents/Codes/Project KryOS/Mesh/build"
+  ],
+  "idf.openOcdConfigs": [
+    "board/esp32c3-ftdi.cfg"
+  ],
+  "clangd.path": "/home/hiroroo/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "idf.flashType": "UART"
+}
