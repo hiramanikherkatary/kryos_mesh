@@ -78,3 +78,6 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 
 *.csv
+
+# Local mesh analysis scripts, virtualenv, and generated reports
+/mesh_analysis/

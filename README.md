@@ -23,7 +23,8 @@ With all four nodes online, the expected consensus value is:
 - Standalone ESP-MESH tree topology.
 - No router dependency: `cfg.router.ssid_len = 0`.
 - One leader and three child sensor nodes.
-- Sensor Quorum Consensus over the latest reading from all four nodes.
+- Sensor Quorum Consensus over the latest readings, with a 3-of-4 default quorum so one powered-off node does not stall consensus.
+- Child-node mesh recovery watchdog that forces parent reselection and restarts ESP-MESH if a node stays orphaned.
 - UART consensus logs with per-node status.
 - Future root-ESP32 uplink stub through `ROOT_UPLINK_STAGED`.
 - Wi-Fi TX power capped to `8.5 dBm` on all ESP32-C3 boards.
@@ -106,11 +107,13 @@ I (...) KryOS_MESH: ROOT_UPLINK_STAGED round=97 ts=201 temp=4.300 C nodes=0x0f r
 Important fields:
 
 - `temp=4.300 C`: consensus value.
-- `verified=4`: all four readings were accepted.
+- `verified=4`: all four readings were accepted in this healthy example. The default quorum is 3, so consensus can continue with one stale or powered-off node.
 - `mask=0x0f`: nodes 1, 2, 3, and 4 are active.
 - `rejected=0x00`: no outliers.
 - `fault=0x00`: no stale or faulted nodes.
 - `status=NOMINAL`: consensus is healthy.
+
+Readings below `KRYOS_MIN_LINK_QUALITY` are logged as `LOW_LINK`, rejected from consensus, and marked in the fault mask. Field nodes with repeated low-link rounds force ESP-MESH parent reselection so moving an already-powered child closer to the leader can recover without reflashing or rebooting.
 
 ## Configuration
 
@@ -121,8 +124,14 @@ Main tunables live in [main/mesh_config.h](main/mesh_config.h):
 | `KRYOS_CONSENSUS_NODE_COUNT` | Number of nodes participating in consensus |
 | `KRYOS_ASQC_MIN_QUORUM` | Minimum verified readings required for consensus |
 | `KRYOS_ASQC_DELTA_T_C` | Maximum allowed distance from median before rejection |
+| `KRYOS_MIN_LINK_QUALITY` | Minimum link quality accepted into consensus; default is `20%` |
 | `KRYOS_SENSOR_PERIOD_MS` | Child sensor publish period |
 | `KRYOS_CONSENSUS_PERIOD_MS` | Leader consensus period |
+| `KRYOS_NODE_STALE_SECONDS` | Time before a missing node is treated as stale |
+| `KRYOS_MESH_AP_ASSOC_EXPIRE_SECONDS` | Mesh child inactivity timeout; kept high for encrypted mesh APs |
+| `KRYOS_MESH_REJOIN_SELECT_PARENT_MS` | Time before an orphaned child forces parent reselection |
+| `KRYOS_MESH_REJOIN_RESTART_MS` | Time before an orphaned child restarts ESP-MESH |
+| `KRYOS_MESH_POOR_LINK_RESELECT_ROUNDS` | Low-quality send rounds before a connected child asks for a better parent |
 | `KRYOS_WIFI_TX_POWER_QDBM` | TX power in quarter-dBm units; `34` means `8.5 dBm` |
 | `KRYOS_ENABLE_ROOT_UPLINK` | Reserved for later leader-to-root ESP32 transport |
 
@@ -173,4 +182,3 @@ Clean generated build files:
 ```bash
 idf.py fullclean
 ```
-

@@ -44,6 +44,7 @@ typedef enum {
     KRYOS_STATUS_QUORUM_FAIL = 2,
     KRYOS_STATUS_AUTH_FAIL = 3,
     KRYOS_STATUS_NODE_FAULT = 4,
+    KRYOS_STATUS_LINK_FAULT = 5,
 } kryos_status_t;
 
 typedef struct __attribute__((packed)) {
@@ -96,7 +97,9 @@ static const uint8_t s_mesh_id[6] = {
 
 static uint8_t s_rx_buf[KRYOS_RX_BUF_SIZE];
 static bool s_mesh_connected;
+static bool s_mesh_started;
 static bool s_tasks_started;
+static bool s_recovery_task_started;
 static int s_mesh_layer = -1;
 static int16_t s_parent_rssi = -50;
 static mesh_addr_t s_parent_addr;
@@ -107,6 +110,11 @@ static uint32_t s_consensus_round_id;
 static bool s_use_synthetic_temperature;
 static float s_synthetic_temperature_c;
 static kryos_status_t s_last_status = KRYOS_STATUS_NOMINAL;
+static int64_t s_last_mesh_disconnect_us;
+static int64_t s_last_rejoin_action_us;
+static int64_t s_last_poor_link_reselect_us;
+static uint32_t s_mesh_restart_count;
+static uint8_t s_consecutive_poor_link_rounds;
 
 static esp_err_t log_esp_err(esp_err_t err, const char *what)
 {
@@ -120,6 +128,15 @@ static esp_err_t log_esp_err(esp_err_t err, const char *what)
 static uint32_t now_s(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static uint32_t elapsed_ms_since(int64_t since_us)
+{
+    if (since_us <= 0) {
+        return UINT32_MAX;
+    }
+
+    return (uint32_t)((esp_timer_get_time() - since_us) / 1000);
 }
 
 static float milli_to_c(int32_t milli_c)
@@ -150,6 +167,11 @@ static bool temperature_valid(float temp_c)
     return temp_c >= TEMP_MIN_VALID && temp_c <= TEMP_MAX_VALID;
 }
 
+static bool link_quality_usable(uint8_t quality_score)
+{
+    return quality_score >= KRYOS_MIN_LINK_QUALITY;
+}
+
 static void update_parent_rssi(void)
 {
     wifi_ap_record_t ap = {0};
@@ -171,9 +193,35 @@ static const char *status_name(kryos_status_t status)
         return "AUTH_FAIL";
     case KRYOS_STATUS_NODE_FAULT:
         return "NODE_FAULT";
+    case KRYOS_STATUS_LINK_FAULT:
+        return "LINK_FAULT";
     default:
         return "UNKNOWN";
     }
+}
+
+static void request_parent_reselection(const char *reason)
+{
+    if (KRYOS_IS_MESH_ROOT || !s_mesh_started) {
+        return;
+    }
+
+    uint32_t action_age_ms = elapsed_ms_since(s_last_rejoin_action_us);
+    uint32_t poor_reselect_age_ms = elapsed_ms_since(s_last_poor_link_reselect_us);
+    if (action_age_ms < KRYOS_MESH_REJOIN_BACKOFF_MS ||
+        poor_reselect_age_ms < KRYOS_MESH_POOR_LINK_RESELECT_BACKOFF_MS) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Forcing parent reselection: %s", reason);
+    esp_err_t err = esp_mesh_set_self_organized(true, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Parent reselection request failed: %s", esp_err_to_name(err));
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    s_last_rejoin_action_us = now_us;
+    s_last_poor_link_reselect_us = now_us;
 }
 
 static int compare_i32(const void *left, const void *right)
@@ -299,13 +347,14 @@ static void update_slot_from_reading(uint8_t node_id, uint32_t round_id,
 static void publish_sensor_frame(bool sensor_fault, float temp_c)
 {
     update_parent_rssi();
+    uint8_t quality_score = quality_from_rssi(s_parent_rssi);
 
     kryos_sensor_frame_t frame = {
         .magic = KRYOS_PROTOCOL_MAGIC,
         .version = KRYOS_PROTOCOL_VERSION,
         .type = sensor_fault ? KRYOS_MSG_SENSOR_FAULT : KRYOS_MSG_SENSOR_READING,
         .node_id = KRYOS_NODE_ID,
-        .quality_score = quality_from_rssi(s_parent_rssi),
+        .quality_score = quality_score,
         .rssi_dbm = s_parent_rssi,
         .round_id = ++s_local_round_id,
         .timestamp_s = now_s(),
@@ -313,9 +362,19 @@ static void publish_sensor_frame(bool sensor_fault, float temp_c)
         .fault_code = sensor_fault ? 1 : 0,
     };
 
-    if (frame.quality_score < QUALITY_FAIR) {
+    if (!link_quality_usable(frame.quality_score)) {
+        if (s_consecutive_poor_link_rounds < UINT8_MAX) {
+            s_consecutive_poor_link_rounds++;
+        }
         ESP_LOGW(TAG, "ASQC low link quality: RSSI=%d dBm quality=%" PRIu8 "%%",
                  frame.rssi_dbm, frame.quality_score);
+
+        if (s_consecutive_poor_link_rounds >= KRYOS_MESH_POOR_LINK_RESELECT_ROUNDS) {
+            request_parent_reselection("link quality below ASQC threshold");
+            s_consecutive_poor_link_rounds = 0;
+        }
+    } else {
+        s_consecutive_poor_link_rounds = 0;
     }
 
     esp_err_t err = send_mesh_payload(&frame, sizeof(frame));
@@ -327,7 +386,8 @@ static void publish_sensor_frame(bool sensor_fault, float temp_c)
 
     ESP_LOGI(TAG, "Sensor round %" PRIu32 ": %.3f C, q=%" PRIu8 "%%, %s",
              frame.round_id, temp_c, frame.quality_score,
-             sensor_fault ? "FAULT" : "OK");
+             sensor_fault ? "FAULT" :
+             (link_quality_usable(frame.quality_score) ? "OK" : "LOW_LINK"));
 }
 
 static void sensor_task(void *arg)
@@ -390,7 +450,8 @@ static void handle_sensor_frame(const kryos_sensor_frame_t *frame, const mesh_ad
                       " temp=%.3f C q=%" PRIu8 "%% %s",
                  MAC2STR(from->addr), frame->node_id, frame->round_id,
                  milli_to_c(frame->temperature_milli_c), frame->quality_score,
-                 frame->type == KRYOS_MSG_SENSOR_FAULT ? "FAULT" : "OK");
+                 frame->type == KRYOS_MSG_SENSOR_FAULT ? "FAULT" :
+                 (link_quality_usable(frame->quality_score) ? "OK" : "LOW_LINK"));
         return;
     }
 
@@ -410,7 +471,8 @@ static void handle_sensor_frame(const kryos_sensor_frame_t *frame, const mesh_ad
 
     ESP_LOGI(TAG, "RX node=%" PRIu8 " round=%" PRIu32 " temp=%.3f C q=%" PRIu8 "%% %s",
              frame->node_id, frame->round_id, milli_to_c(frame->temperature_milli_c),
-             frame->quality_score, frame->type == KRYOS_MSG_SENSOR_FAULT ? "FAULT" : "OK");
+             frame->quality_score, frame->type == KRYOS_MSG_SENSOR_FAULT ? "FAULT" :
+             (link_quality_usable(frame->quality_score) ? "OK" : "LOW_LINK"));
 }
 
 static void handle_consensus_frame(const kryos_consensus_frame_t *frame)
@@ -461,6 +523,60 @@ static void mesh_rx_task(void *arg)
     }
 }
 
+static void mesh_recovery_task(void *arg)
+{
+    ESP_LOGI(TAG, "Mesh recovery watchdog started");
+
+    while (true) {
+        if (!KRYOS_IS_MESH_ROOT && s_mesh_started && !s_mesh_connected) {
+            if (s_last_mesh_disconnect_us == 0) {
+                s_last_mesh_disconnect_us = esp_timer_get_time();
+            }
+
+            uint32_t disconnected_ms = elapsed_ms_since(s_last_mesh_disconnect_us);
+            uint32_t action_age_ms = elapsed_ms_since(s_last_rejoin_action_us);
+
+            if (disconnected_ms >= KRYOS_MESH_REJOIN_RESTART_MS &&
+                action_age_ms >= KRYOS_MESH_REJOIN_BACKOFF_MS) {
+                ESP_LOGW(TAG,
+                         "Mesh orphaned for %" PRIu32 " ms; restarting mesh stack (count=%" PRIu32 ")",
+                         disconnected_ms, ++s_mesh_restart_count);
+
+                esp_err_t err = esp_mesh_stop();
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "esp_mesh_stop during rejoin failed: %s",
+                             esp_err_to_name(err));
+                } else {
+                    s_mesh_started = false;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(1000));
+
+                err = esp_mesh_start();
+                if (err == ESP_OK) {
+                    s_mesh_started = true;
+                    s_last_mesh_disconnect_us = esp_timer_get_time();
+                    ESP_LOGI(TAG, "Mesh restart requested; waiting for parent");
+                } else {
+                    ESP_LOGE(TAG, "esp_mesh_start during rejoin failed: %s",
+                             esp_err_to_name(err));
+                }
+
+                s_last_rejoin_action_us = esp_timer_get_time();
+            } else if (disconnected_ms >= KRYOS_MESH_REJOIN_SELECT_PARENT_MS &&
+                       action_age_ms >= KRYOS_MESH_REJOIN_BACKOFF_MS) {
+                ESP_LOGW(TAG, "Mesh orphaned for %" PRIu32 " ms", disconnected_ms);
+                request_parent_reselection("no parent while mesh is started");
+            }
+        } else if (s_mesh_connected) {
+            s_last_mesh_disconnect_us = 0;
+            s_last_rejoin_action_us = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 static void update_leader_local_slot(void)
 {
     if (!KRYOS_IS_LEADER) {
@@ -488,6 +604,7 @@ static void build_consensus_round(kryos_consensus_frame_t *out_frame)
     uint8_t fault_mask = 0;
     uint8_t rejected_mask = 0;
     uint16_t quality_sum = 0;
+    uint8_t low_link_mask = 0;
 
     update_leader_local_slot();
 
@@ -502,6 +619,13 @@ static void build_consensus_round(kryos_consensus_frame_t *out_frame)
 
         node_mask |= bit;
         quality_sum += slot->quality_score;
+
+        if (!link_quality_usable(slot->quality_score)) {
+            low_link_mask |= bit;
+            rejected_mask |= bit;
+            fault_mask |= bit;
+            continue;
+        }
 
         if (slot->sensor_fault) {
             fault_mask |= bit;
@@ -551,6 +675,8 @@ static void build_consensus_round(kryos_consensus_frame_t *out_frame)
     kryos_status_t status = KRYOS_STATUS_NOMINAL;
     if (!quorum_ok) {
         status = KRYOS_STATUS_QUORUM_FAIL;
+    } else if (low_link_mask != 0) {
+        status = KRYOS_STATUS_LINK_FAULT;
     } else if (fault_mask != 0) {
         status = KRYOS_STATUS_NODE_FAULT;
     } else if (rejected_mask != 0) {
@@ -675,6 +801,17 @@ static void start_runtime_tasks(void)
     }
 }
 
+static void start_mesh_recovery_task(void)
+{
+    if (s_recovery_task_started || KRYOS_IS_MESH_ROOT) {
+        return;
+    }
+
+    s_recovery_task_started = true;
+    xTaskCreate(mesh_recovery_task, "kryos_rejoin", STACK_MESH_TASK, NULL,
+                TASK_PRIORITY_MESH, NULL);
+}
+
 static void mesh_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -683,6 +820,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
     switch (event_id) {
     case MESH_EVENT_STARTED:
         esp_mesh_get_id(&mesh_id);
+        s_mesh_started = true;
         s_mesh_layer = esp_mesh_get_layer();
         ESP_LOGI(TAG, "MESH_STARTED id=" MACSTR " role=%s",
                  MAC2STR(mesh_id.addr), KRYOS_IS_ROOT_NODE ? "ROOT_BRIDGE" :
@@ -694,6 +832,7 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
         break;
 
     case MESH_EVENT_STOPPED:
+        s_mesh_started = false;
         s_mesh_connected = false;
         ESP_LOGW(TAG, "MESH_STOPPED");
         break;
@@ -715,6 +854,10 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
         s_mesh_layer = connected->self_layer;
         memcpy(s_parent_addr.addr, connected->connected.bssid, sizeof(s_parent_addr.addr));
         s_mesh_connected = true;
+        s_last_mesh_disconnect_us = 0;
+        s_last_rejoin_action_us = 0;
+        s_last_poor_link_reselect_us = 0;
+        s_consecutive_poor_link_rounds = 0;
         ESP_LOGI(TAG, "PARENT_CONNECTED layer=%d parent=" MACSTR "%s",
                  s_mesh_layer, MAC2STR(s_parent_addr.addr),
                  esp_mesh_is_root() ? " ROOT" : "");
@@ -726,7 +869,19 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
         mesh_event_disconnected_t *disconnected = (mesh_event_disconnected_t *)event_data;
         s_mesh_connected = KRYOS_IS_MESH_ROOT;
         s_mesh_layer = esp_mesh_get_layer();
+        if (!KRYOS_IS_MESH_ROOT) {
+            s_last_mesh_disconnect_us = esp_timer_get_time();
+        }
         ESP_LOGW(TAG, "PARENT_DISCONNECTED reason=%d", disconnected->reason);
+        break;
+    }
+
+    case MESH_EVENT_NO_PARENT_FOUND: {
+        mesh_event_no_parent_found_t *no_parent = (mesh_event_no_parent_found_t *)event_data;
+        if (!KRYOS_IS_MESH_ROOT && s_last_mesh_disconnect_us == 0) {
+            s_last_mesh_disconnect_us = esp_timer_get_time();
+        }
+        ESP_LOGW(TAG, "NO_PARENT_FOUND scan_times=%d", no_parent->scan_times);
         break;
     }
 
@@ -795,7 +950,9 @@ static void initialize_mesh(void)
     ESP_ERROR_CHECK(esp_mesh_init());
     ESP_ERROR_CHECK(esp_mesh_set_topology(MESH_TOPO_TREE));
     ESP_ERROR_CHECK(esp_mesh_set_max_layer(KRYOS_MESH_MAX_LAYER));
-    ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(10));
+    ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(KRYOS_MESH_AP_ASSOC_EXPIRE_SECONDS));
+    ESP_ERROR_CHECK(esp_mesh_set_capacity_num(KRYOS_MAX_MESH_DEVICES));
+    ESP_ERROR_CHECK(esp_mesh_set_root_healing_delay(KRYOS_MESH_ROOT_HEALING_DELAY_MS));
     ESP_ERROR_CHECK(esp_mesh_fix_root(true));
     (void)log_esp_err(esp_mesh_set_vote_percentage(1), "esp_mesh_set_vote_percentage");
     (void)log_esp_err(esp_mesh_set_xon_qsize(32), "esp_mesh_set_xon_qsize");
@@ -817,6 +974,8 @@ static void initialize_mesh(void)
     ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(WIFI_AUTH_WPA2_PSK));
     ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
     ESP_ERROR_CHECK(esp_mesh_start());
+    s_mesh_started = true;
+    start_mesh_recovery_task();
 }
 
 void app_main(void)

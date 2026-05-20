@@ -44,6 +44,13 @@
 #define MESH_SOFTAP_PASSWD       "KryOSMesh"
 #define MESH_MAX_CHILDREN        KRYOS_CHILD_NODE_COUNT
 #define KRYOS_MESH_MAX_LAYER     3
+#define KRYOS_MESH_AP_ASSOC_EXPIRE_SECONDS 60
+#define KRYOS_MESH_ROOT_HEALING_DELAY_MS   10000
+#define KRYOS_MESH_REJOIN_SELECT_PARENT_MS 10000
+#define KRYOS_MESH_REJOIN_RESTART_MS       30000
+#define KRYOS_MESH_REJOIN_BACKOFF_MS        5000
+#define KRYOS_MESH_POOR_LINK_RESELECT_ROUNDS 3
+#define KRYOS_MESH_POOR_LINK_RESELECT_BACKOFF_MS 15000
 
 /* ESP-IDF uses quarter-dBm units. 34 == 8.5 dBm. */
 #define KRYOS_WIFI_TX_POWER_QDBM 34
@@ -61,7 +68,9 @@
 #define KRYOS_SENSOR_PERIOD_MS          5000
 #define KRYOS_CONSENSUS_PERIOD_MS       5000
 #define KRYOS_FAST_CONSENSUS_PERIOD_MS  1000
-#define KRYOS_NODE_STALE_SECONDS        12
+#ifndef KRYOS_NODE_STALE_SECONDS
+#define KRYOS_NODE_STALE_SECONDS        20
+#endif
 
 /* Signal quality mapping and minimum acceptable quorum. */
 #define ASQC_SIGNAL_EXCELLENT  -30
@@ -74,10 +83,17 @@
 #define QUALITY_GOOD            70
 #define QUALITY_FAIR            50
 #define QUALITY_POOR             0
+#define KRYOS_MIN_LINK_QUALITY  20
 
-#define KRYOS_ASQC_MIN_QUORUM       4
+#ifndef KRYOS_ASQC_MIN_QUORUM
+#define KRYOS_ASQC_MIN_QUORUM       3
+#endif
 #define KRYOS_ASQC_DELTA_T_C        1.50f
 #define KRYOS_FAULT_LATCH_ROUNDS    10
+
+#if KRYOS_ASQC_MIN_QUORUM > KRYOS_CONSENSUS_NODE_COUNT
+#error "KRYOS_ASQC_MIN_QUORUM cannot exceed KRYOS_CONSENSUS_NODE_COUNT"
+#endif
 
 /* Deterministic lab temperatures: node 1=4.0 C, node 2=4.2 C, etc. */
 #define KRYOS_SIM_TEMP_BASE_C       4.0f
