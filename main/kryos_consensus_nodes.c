@@ -88,6 +88,8 @@ typedef struct {
     uint32_t last_seen_s;
     int32_t temperature_milli_c;
     int16_t rssi_dbm;
+    uint8_t mac[6];
+    bool mac_valid;
 } kryos_node_slot_t;
 
 static const char *TAG = LOG_TAG_MESH;
@@ -246,6 +248,8 @@ static int32_t median_milli(const int32_t *values, uint8_t count)
     return copy[count / 2];
 }
 
+static bool should_send_to_mac(const uint8_t *mac);
+
 static esp_err_t send_to_mesh_root(const void *payload, size_t payload_len)
 {
     mesh_data_t data = {
@@ -272,6 +276,9 @@ static esp_err_t send_from_mesh_root(const void *payload, size_t payload_len)
 
     esp_mesh_get_routing_table(route_table, sizeof(route_table), &route_table_size);
     for (int i = 0; i < route_table_size; ++i) {
+        if (!should_send_to_mac(route_table[i].addr)) {
+            continue;
+        }
         esp_err_t err = esp_mesh_send(&route_table[i], &data, MESH_DATA_FROMDS, NULL, 0);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Consensus fanout to " MACSTR " failed: %s",
@@ -327,7 +334,8 @@ static kryos_node_slot_t *slot_for_node_id(uint8_t node_id)
 
 static void update_slot_from_reading(uint8_t node_id, uint32_t round_id,
                                      bool sensor_fault, float temp_c,
-                                     uint8_t quality_score, int16_t rssi_dbm)
+                                     uint8_t quality_score, int16_t rssi_dbm,
+                                     const uint8_t *mac)
 {
     kryos_node_slot_t *slot = slot_for_node_id(node_id);
     if (slot == NULL) {
@@ -342,6 +350,56 @@ static void update_slot_from_reading(uint8_t node_id, uint32_t round_id,
     slot->last_seen_s = now_s();
     slot->temperature_milli_c = c_to_milli(temp_c);
     slot->rssi_dbm = rssi_dbm;
+    if (mac != NULL) {
+        memcpy(slot->mac, mac, sizeof(slot->mac));
+        slot->mac_valid = true;
+    }
+}
+
+static void mark_slot_offline_by_mac(const uint8_t *mac, const char *reason)
+{
+    if (mac == NULL) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < KRYOS_CONSENSUS_NODE_COUNT; ++i) {
+        kryos_node_slot_t *slot = &s_slots[i];
+
+        if (!slot->mac_valid || memcmp(slot->mac, mac, sizeof(slot->mac)) != 0) {
+            continue;
+        }
+
+        slot->present = false;
+        slot->sensor_fault = true;
+        slot->quality_score = 0;
+        slot->consecutive_rejections = 0;
+        slot->last_round_id = 0;
+        slot->last_seen_s = 0;
+        slot->rssi_dbm = 0;
+
+        ESP_LOGW(TAG, "Node %" PRIu8 " offline (%s); dropping from consensus",
+                 (uint8_t)(i + 1), reason);
+        return;
+    }
+}
+
+static bool should_send_to_mac(const uint8_t *mac)
+{
+    if (mac == NULL) {
+        return true;
+    }
+
+    for (uint8_t i = 0; i < KRYOS_CONSENSUS_NODE_COUNT; ++i) {
+        const kryos_node_slot_t *slot = &s_slots[i];
+
+        if (!slot->mac_valid || memcmp(slot->mac, mac, sizeof(slot->mac)) != 0) {
+            continue;
+        }
+
+        return slot->present;
+    }
+
+    return true;
 }
 
 static void publish_sensor_frame(bool sensor_fault, float temp_c)
@@ -443,9 +501,10 @@ static void handle_sensor_frame(const kryos_sensor_frame_t *frame, const mesh_ad
         }
 
         update_slot_from_reading(frame->node_id, frame->round_id,
-                                 frame->type == KRYOS_MSG_SENSOR_FAULT,
-                                 milli_to_c(frame->temperature_milli_c),
-                                 frame->quality_score, frame->rssi_dbm);
+                     frame->type == KRYOS_MSG_SENSOR_FAULT,
+                     milli_to_c(frame->temperature_milli_c),
+                     frame->quality_score, frame->rssi_dbm,
+                     from->addr);
         ESP_LOGI(TAG, "LEADER RX child=" MACSTR " node=%" PRIu8 " round=%" PRIu32
                       " temp=%.3f C q=%" PRIu8 "%% %s",
                  MAC2STR(from->addr), frame->node_id, frame->round_id,
@@ -467,7 +526,8 @@ static void handle_sensor_frame(const kryos_sensor_frame_t *frame, const mesh_ad
     update_slot_from_reading(frame->node_id, frame->round_id,
                              frame->type == KRYOS_MSG_SENSOR_FAULT,
                              milli_to_c(frame->temperature_milli_c),
-                             frame->quality_score, frame->rssi_dbm);
+                             frame->quality_score, frame->rssi_dbm,
+                             from->addr);
 
     ESP_LOGI(TAG, "RX node=%" PRIu8 " round=%" PRIu32 " temp=%.3f C q=%" PRIu8 "%% %s",
              frame->node_id, frame->round_id, milli_to_c(frame->temperature_milli_c),
@@ -586,7 +646,7 @@ static void update_leader_local_slot(void)
     bool sensor_fault = false;
     float temp_c = get_temperature_reading_c(&sensor_fault);
     update_slot_from_reading(KRYOS_NODE_ID, ++s_local_round_id, sensor_fault,
-                             temp_c, 100, 0);
+                             temp_c, 100, 0, NULL);
 
     ESP_LOGI(TAG, "LEADER local node=%" PRIu8 " round=%" PRIu32
                   " temp=%.3f C %s",
@@ -846,6 +906,9 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
     case MESH_EVENT_CHILD_DISCONNECTED: {
         mesh_event_child_disconnected_t *child = (mesh_event_child_disconnected_t *)event_data;
         ESP_LOGW(TAG, "CHILD_DISCONNECTED aid=%d mac=" MACSTR, child->aid, MAC2STR(child->mac));
+        if (KRYOS_IS_LEADER) {
+            mark_slot_offline_by_mac(child->mac, "mesh child disconnected");
+        }
         break;
     }
 
