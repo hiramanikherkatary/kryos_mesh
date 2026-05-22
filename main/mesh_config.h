@@ -3,41 +3,39 @@
 
 #include <stdint.h>
 
-/* KryOS ESP32-C3 ESP-MESH configuration.
- *
- * Default build is for a child sensor node.
- *
- * Build examples:
- *   KRYOS_NODE_ROLE_LEADER=1 KRYOS_NODE_ID=1 idf.py build
- *   KRYOS_NODE_ROLE_LEADER=0 KRYOS_NODE_ID=2 idf.py build
- *   KRYOS_NODE_ROLE_LEADER=0 KRYOS_NODE_ID=3 idf.py build
- *   KRYOS_NODE_ROLE_LEADER=0 KRYOS_NODE_ID=4 idf.py build
- */
 
 #ifndef KRYOS_NODE_ID
-#define KRYOS_NODE_ID 1
+#define KRYOS_NODE_ID 4
 #endif
 
-#ifndef KRYOS_NODE_ROLE_ROOT
-#define KRYOS_NODE_ROLE_ROOT 0
-#endif
-
-#ifndef KRYOS_NODE_ROLE_LEADER
-#define KRYOS_NODE_ROLE_LEADER 1
-#endif
-
-#define KRYOS_IS_ROOT_NODE       (KRYOS_NODE_ROLE_ROOT == 1)
-#define KRYOS_IS_LEADER          (KRYOS_NODE_ROLE_LEADER == 1)
-#define KRYOS_IS_FIELD_SENSOR    (!KRYOS_IS_ROOT_NODE && !KRYOS_IS_LEADER)
-#define KRYOS_IS_MESH_ROOT       (KRYOS_IS_ROOT_NODE || KRYOS_IS_LEADER)
 #define KRYOS_CONSENSUS_NODE_COUNT 4
 #define KRYOS_CHILD_NODE_COUNT   (KRYOS_CONSENSUS_NODE_COUNT - 1)
 #define KRYOS_MAX_MESH_DEVICES   KRYOS_CONSENSUS_NODE_COUNT
-#define KRYOS_SINGLE_BOARD_LAB   0
 
 #ifndef KRYOS_ENABLE_ROOT_UPLINK
-#define KRYOS_ENABLE_ROOT_UPLINK 0
+#define KRYOS_ENABLE_ROOT_UPLINK 1
 #endif
+
+/* Election Stability & Hysteresis */
+#define KRYOS_ELECTION_HYSTERESIS_DBM   8   /* Must be 8dB better to switch */
+#define KRYOS_LEADERSHIP_LOCK_ROUNDS   10   /* Min rounds to hold leadership */
+
+/* Pre-shared keys for HMAC-SHA256 (32 bytes). 
+ * In production, these should be unique and securely provisioned. 
+ */
+#define KRYOS_NODE_PSK { \
+    0x4b, 0x72, 0x79, 0x4f, 0x53, 0x5f, 0x4e, 0x6f, \
+    0x64, 0x65, 0x5f, 0x53, 0x65, 0x63, 0x72, 0x65, \
+    0x74, 0x5f, 0x4b, 0x65, 0x79, 0x5f, 0x32, 0x30, \
+    0x32, 0x36, 0x5f, 0x30, 0x35, 0x5f, 0x32, 0x32  \
+}
+
+#define KRYOS_MASTER_PSK { \
+    0x4b, 0x72, 0x79, 0x4f, 0x53, 0x5f, 0x4d, 0x61, \
+    0x73, 0x74, 0x65, 0x72, 0x5f, 0x53, 0x65, 0x63, \
+    0x72, 0x65, 0x74, 0x5f, 0x4b, 0x65, 0x79, 0x5f, \
+    0x32, 0x30, 0x32, 0x36, 0x5f, 0x30, 0x35, 0x5f  \
+}
 
 /* ESP-MESH: offline-first, fixed-root tree. */
 #define MESH_CHANNEL             6

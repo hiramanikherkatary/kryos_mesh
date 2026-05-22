@@ -81,3 +81,4 @@ Desktop.ini
 
 # Local mesh analysis scripts, virtualenv, and generated reports
 /mesh_analysis/
+/Adverserial Test Results/
